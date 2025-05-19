@@ -1,0 +1,237 @@
+1. 创建项目目录结构和必要的子目录
+mkdir myproject && cd myproject
+mkdir -p nginx/conf django-uwsgi mysql
+2. 配置Nginx服务器
+在nginx/conf目录下创建两个配置文件：
+nginx/conf/nginx.conf (Nginx全局配置):
+[root@host1 myproject]# cd nginx/conf/
+[root@host1 conf]# vim nginx.conf
+user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    keepalive_timeout  65;
+
+    #gzip  on;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+nginx/conf/django-nginx.conf (Django特定配置):
+[root@host1 conf]# vim django-nginx.conf
+upstream django {
+    server django-uwsgi:8000;
+}
+
+server {
+    listen      80;
+    server_name localhost;
+
+    client_max_body_size 75M;
+
+    location / {
+        uwsgi_pass  django;
+        include     /etc/nginx/uwsgi_params;
+    }
+
+    location /static/ {
+        alias /code/static/;
+    }
+
+    location /media/ {
+        alias /code/media/;
+    }
+}
+3. 配置Django与uWSGI
+a. 在django-uwsgi目录下创建Dockerfile:
+[root@host1 conf]# cd ..
+[root@host1 nginx]# cd ..
+[root@host1 myproject]# cd django-uwsgi/
+[root@host1 django-uwsgi]# vim Dockerfile
+FROM python:3.9-slim
+# 设置环境变量
+ENV PYTHONUNBUFFERED 1
+
+# 创建并设置工作目录
+RUN mkdir /code
+WORKDIR /code
+
+# 安装系统依赖，包括 MySQL 客户端库和开发头文件
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    default-libmysqlclient-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建虚拟环境
+RUN python -m venv /opt/venv
+
+# 激活虚拟环境
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 复制 requirements.txt 文件到容器中
+COPY ./requirements.txt /code/
+
+# 升级 pip 并安装依赖
+RUN pip install --upgrade pip \
+  && pip install -r requirements.txt
+
+# 复制项目代码到容器中
+COPY . /code/
+
+# 暴露端口（假设应用运行在8000端口）
+EXPOSE 8000
+b. 在django-uwsgi目录下创建uwsgi.ini文件来配置uWSGI服务器：
+[root@host1 django-uwsgi]# vim uwsgi.ini
+[uwsgi]
+# Django-related settings
+# the base directory (full path)
+chdir = /code
+# Django's wsgi file
+module = project.wsgi:application
+
+# process-related settings
+# master
+master = true
+# maximum number of worker processes
+processes = 4
+# the socket (use the full path to be safe)
+socket = :8000
+# ... with appropriate permissions - may be needed
+# chmod-socket = 664
+# clear environment on exit
+vacuum = true
+4. 配置MySQL
+创建mysql/Dockerfile:
+[root@host1 django-uwsgi]# cd ..
+[root@host1 myproject]# cd mysql/
+[root@host1 mysql]# vim Dockerfile
+FROM mysql:8.0
+
+# 设置环境变量
+ENV MYSQL_DATABASE=mydjangodb \
+    MYSQL_USER=django \
+    MYSQL_PASSWORD=djangopass \
+    MYSQL_ROOT_PASSWORD=rootpass
+
+# 复制SQL文件到容器中
+# COPY init.sql /docker-entrypoint-initdb.d/
+
+EXPOSE 3306
+5. 在项目根目录下创建docker-compose.yml
+[root@host1 mysql]# cd ..
+[root@host1 myproject]# vim docker-compose.yml
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/conf/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf/django-nginx.conf:/etc/nginx/conf.d/default.conf
+      - static_volume:/code/static
+      - media_volume:/code/media
+    depends_on:
+      - django-uwsgi
+
+  django-uwsgi:
+    build:
+      context: ./django-uwsgi
+      dockerfile: Dockerfile
+    command: uwsgi --ini /code/uwsgi.ini
+    volumes:
+      - ./django-uwsgi:/code
+      - static_volume:/code/static
+      - media_volume:/code/media
+    depends_on:
+      - mysql
+    environment:
+      - DJANGO_SETTINGS_MODULE=project.settings
+      - DATABASE_URL=mysql://django:djangopass@mysql:3306/mydjangodb
+
+  mysql:
+    build:
+      context: ./mysql
+      dockerfile: Dockerfile
+    volumes:
+      - mysql_data:/var/lib/mysql
+    environment:
+      - MYSQL_DATABASE=mydjangodb
+      - MYSQL_USER=django
+      - MYSQL_PASSWORD=djangopass
+      - MYSQL_ROOT_PASSWORD=rootpass
+    ports:
+      - "3306:3306"
+
+volumes:
+  static_volume:
+  media_volume:
+  mysql_data:
+6. 在django-uwsgi目录下创建requirements.txt
+基于官方的Python镜像安装的软件具体由requirements.txt文件定义
+[root@host1 myproject]# cd django-uwsgi/
+[root@host1 django-uwsgi]# vim requirements.txt
+Django>=4.0,<5.0
+django-tinymce4-lite
+django-bootstrap4
+mysqlclient
+django-jet
+uwsgi
+7. 构建服务
+在项目根目录下执行：
+[root@host1 django-uwsgi]# cd ..
+[root@host1 myproject]# docker-compose build --no-cache
+8. 创建Django初始项目
+在项目根目录下执行：
+[root@host1 myproject]# docker-compose run django-uwsgi django-admin startproject project .
+[root@host1 myproject]# docker-compose up -d
+
+9. 修改Django设置
+编辑django-uwsgi/project/settings.py，修改以下部分：
+[root@host1 myproject]# cd django-uwsgi/project/
+[root@host1 project]# vim settings.py
+修改28，77，123行的内容
+:set nu    #查看行号
+：28    #跳转到28行修改
+ 
+28 ALLOWED_HOSTS = ['*']
+
+77：
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'mydjangodb',
+        'USER': 'django',
+        'PASSWORD': 'djangopass',
+        'HOST': 'mysql',
+        'PORT': '3306',
+    }
+}
+
+123 STATIC_URL = '/static/'
+
+10. 启动应用程序
+在项目根目录下执行：
+[root@host1 project]# cd ..
+[root@host1 django-uwsgi]# cd ..
+[root@host1 myproject]# docker-compose up
